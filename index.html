@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Head-Tracked 3D Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+        }
+        
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+        
+        #threejs-canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            background: rgba(0,0,0,0.7);
+            padding: 15px;
+            border-radius: 8px;
+            color: white;
+        }
+        
+        #webcam {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 200px;
+            height: 150px;
+            border: 2px solid #333;
+            border-radius: 8px;
+            transform: scaleX(-1); /* Mirror the video */
+        }
+        
+        #debug-info {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            font-family: monospace;
+        }
+        
+        .file-input {
+            margin: 5px 0;
+            padding: 5px;
+            background: #333;
+            border: 1px solid #555;
+            color: white;
+            border-radius: 3px;
+        }
+        
+        .toggle-btn {
+            background: #007acc;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            margin: 5px 0;
+        }
+        
+        .toggle-btn:hover {
+            background: #005a9e;
+        }
+        
+        .status {
+            font-size: 11px;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <canvas id="threejs-canvas"></canvas>
+        
+        <div id="controls">
+            <h3 style="margin: 0 0 10px 0;">Head-Tracked 3D Viewer</h3>
+            <input type="file" id="model-upload" class="file-input" accept=".gltf,.glb,.obj,.fbx" title="Upload 3D Model (.glb, .gltf, .obj)">
+            <br>
+            <button id="toggle-webcam" class="toggle-btn">Start Webcam</button>
+            <button id="toggle-tracking" class="toggle-btn" disabled>Start Tracking</button>
+            <br>
+            <div class="status" id="status">Click "Start Webcam" to begin</div>
+            <br>
+            <label>Screen Width (cm): <input type="number" id="screen-width" value="30" min="10" max="100" step="1"></label>
+            <br>
+            <label>Screen Height (cm): <input type="number" id="screen-height" value="20" min="10" max="100" step="1"></label>
+        </div>
+        
+        <video id="webcam" autoplay muted></video>
+        
+        <div id="debug-info">
+            Head Position: (0, 0)<br>
+            Camera: (0, 0, 5)<br>
+            FPS: 0
+        </div>
+    </div>
+
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Three.js Loaders from unpkg -->
+    <script src="https://unpkg.com/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
+    <!-- MediaPipe Face Detection -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js"></script>
+
+    <script>
+        class HeadTracked3DViewer {
+            constructor() {
+                this.scene = null;
+                this.camera = null;
+                this.renderer = null;
+                this.model = null;
+                this.modelGroup = null; // Group to contain loaded models
+                this.webcam = null;
+                this.faceDetection = null;
+                
+                // Loaders
+                this.gltfLoader = null;
+                this.objLoader = null;
+                
+                this.isWebcamActive = false;
+                this.isTrackingActive = false;
+                
+                // Mouse controls
+                this.mouseControls = {
+                    isMouseDown: false,
+                    mouseX: 0,
+                    mouseY: 0,
+                    rotationX: 0,
+                    rotationY: 0
+                };
+                
+                // Head tracking parameters for fish tank VR
+                this.headPosition = { x: 0, y: 0, z: 60 }; // z is viewing distance in cm
+                this.smoothedHeadPosition = { x: 0, y: 0, z: 60 };
+                this.smoothingFactor = 0.2;
+                
+                // Screen parameters (adjustable for calibration)
+                this.screenWidth = 30; // cm - physical screen width
+                this.screenHeight = 20; // cm - physical screen height  
+                this.averageFaceWidth = 17; // cm - for distance estimation
+                this.baselineViewingDistance = 60; // cm - default viewing distance
+                
+                // Fish tank VR parameters
+                this.worldScreenWidth = 10; // world units that represent the screen
+                this.worldScreenHeight = this.worldScreenWidth * (this.screenHeight / this.screenWidth);
+                
+                // Performance monitoring
+                this.lastTime = 0;
+                this.fps = 0;
+                
+                this.init();
+            }
+            
+            init() {
+                this.setupThreeJS();
+                this.setupLoaders();
+                this.setupControls();
+                this.createDefaultScene();
+                this.animate();
+            }
+            
+            setupThreeJS() {
+                // Scene
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x111111);
+                
+                // Camera
+                this.camera = new THREE.PerspectiveCamera(
+                    75, 
+                    window.innerWidth / window.innerHeight, 
+                    0.1, 
+                    1000
+                );
+                this.camera.position.set(0, 0, 5);
+                
+                // Renderer
+                this.renderer = new THREE.WebGLRenderer({ 
+                    canvas: document.getElementById('threejs-canvas'),
+                    antialias: true 
+                });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.shadowMap.enabled = true;
+                this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+                
+                // Lighting
+                const ambientLight = new THREE.AmbientLight(0x404040, 1.4);
+                this.scene.add(ambientLight);
+                
+                const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+                directionalLight.position.set(5, 5, 5);
+                directionalLight.castShadow = true;
+                this.scene.add(directionalLight);
+                
+                // Handle window resize
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                });
+            }
+            
+            setupLoaders() {
+                // GLTF/GLB Loader
+                this.gltfLoader = new THREE.GLTFLoader();
+                
+                // OBJ Loader
+                this.objLoader = new THREE.OBJLoader();
+            }
+            
+            createDefaultScene() {
+                // Create a model group to contain our 3D objects
+                this.modelGroup = new THREE.Group();
+                this.scene.add(this.modelGroup);
+                
+                // Create a default 3D object (rotating cube with different colored faces)
+                const geometry = new THREE.BoxGeometry(2, 2, 2);
+                const materials = [
+                    new THREE.MeshLambertMaterial({ color: 0xff0000 }), // Red
+                    new THREE.MeshLambertMaterial({ color: 0x00ff00 }), // Green
+                    new THREE.MeshLambertMaterial({ color: 0x0000ff }), // Blue
+                    new THREE.MeshLambertMaterial({ color: 0xffff00 }), // Yellow
+                    new THREE.MeshLambertMaterial({ color: 0xff00ff }), // Magenta
+                    new THREE.MeshLambertMaterial({ color: 0x00ffff })  // Cyan
+                ];
+                
+                this.model = new THREE.Mesh(geometry, materials);
+                this.model.castShadow = true;
+                this.modelGroup.add(this.model);
+                
+                // Add a ground plane for reference
+                const planeGeometry = new THREE.PlaneGeometry(10, 10);
+                const planeMaterial = new THREE.MeshLambertMaterial({ color: 0x333333 });
+                const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+                plane.rotation.x = -Math.PI / 2;
+                plane.position.y = -2;
+                plane.receiveShadow = true;
+                this.scene.add(plane);
+            }
+            
+            setupControls() {
+                const toggleWebcamBtn = document.getElementById('toggle-webcam');
+                const toggleTrackingBtn = document.getElementById('toggle-tracking');
+                const modelUpload = document.getElementById('model-upload');
+                const canvas = document.getElementById('threejs-canvas');
+                
+                // Webcam controls
+                toggleWebcamBtn.addEventListener('click', () => {
+                    if (!this.isWebcamActive) {
+                        this.startWebcam();
+                    } else {
+                        this.stopWebcam();
+                    }
+                });
+                
+                toggleTrackingBtn.addEventListener('click', () => {
+                    if (!this.isTrackingActive) {
+                        this.startTracking();
+                    } else {
+                        this.stopTracking();
+                    }
+                });
+                
+                // File upload
+                modelUpload.addEventListener('change', (event) => {
+                    const file = event.target.files[0];
+                    if (file) {
+                        this.loadModel(file);
+                    }
+                });
+                
+                // Mouse controls for manual model rotation
+                canvas.addEventListener('mousedown', (event) => {
+                    this.mouseControls.isMouseDown = true;
+                    this.mouseControls.mouseX = event.clientX;
+                    this.mouseControls.mouseY = event.clientY;
+                    canvas.style.cursor = 'grabbing';
+                });
+                
+                canvas.addEventListener('mouseup', () => {
+                    this.mouseControls.isMouseDown = false;
+                    canvas.style.cursor = 'grab';
+                });
+                
+                canvas.addEventListener('mouseleave', () => {
+                    this.mouseControls.isMouseDown = false;
+                    canvas.style.cursor = 'grab';
+                });
+                
+                canvas.addEventListener('mousemove', (event) => {
+                    if (this.mouseControls.isMouseDown) {
+                        const deltaX = event.clientX - this.mouseControls.mouseX;
+                        const deltaY = event.clientY - this.mouseControls.mouseY;
+                        
+                        this.mouseControls.rotationY += deltaX * 0.01;
+                        this.mouseControls.rotationX += deltaY * 0.01;
+                        
+                        // Clamp vertical rotation
+                        this.mouseControls.rotationX = Math.max(-Math.PI/2, Math.min(Math.PI/2, this.mouseControls.rotationX));
+                        
+                        this.mouseControls.mouseX = event.clientX;
+                        this.mouseControls.mouseY = event.clientY;
+                        
+                        this.updateModelRotation(); // Use simple rotation method
+                    }
+                });
+                
+                // Mouse wheel for zoom (adjusts camera distance, not object scale)
+                canvas.addEventListener('wheel', (event) => {
+                    event.preventDefault();
+                    
+                    // Adjust the baseline viewing distance for zoom effect
+                    this.baselineViewingDistance += event.deltaY * 0.1;
+                    this.baselineViewingDistance = Math.max(20, Math.min(200, this.baselineViewingDistance));
+                    
+                    if (this.isTrackingActive) {
+                        this.updateCameraProjection();
+                    } else {
+                        // Manual zoom when not tracking
+                        this.camera.position.z = this.baselineViewingDistance / 10;
+                        this.camera.lookAt(0, 0, 0);
+                        this.camera.updateProjectionMatrix();
+                    }
+                });
+                // Screen calibration controls (moved out of wheel handler)
+                const screenWidthInput = document.getElementById('screen-width');
+                const screenHeightInput = document.getElementById('screen-height');
+                if (screenWidthInput) {
+                    screenWidthInput.addEventListener('input', (e) => {
+                        this.screenWidth = parseFloat(e.target.value);
+                        this.worldScreenHeight = this.worldScreenWidth * (this.screenHeight / this.screenWidth);
+                        if (this.isTrackingActive) {
+                            this.updateCameraProjection();
+                        }
+                    });
+                }
+                if (screenHeightInput) {
+                    screenHeightInput.addEventListener('input', (e) => {
+                        this.screenHeight = parseFloat(e.target.value);
+                        this.worldScreenHeight = this.worldScreenWidth * (this.screenHeight / this.screenWidth);
+                        if (this.isTrackingActive) {
+                            this.updateCameraProjection();
+                        }
+                    });
+                }
+                
+                // Set initial camera position for when tracking is disabled
+                this.camera.position.set(0, 0, this.baselineViewingDistance / 10);
+                this.camera.lookAt(0, 0, 0);
+                
+                // Set initial cursor
+                canvas.style.cursor = 'grab';
+            }
+            
+            async startWebcam() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: 640, height: 480 }
+                    });
+                    
+                    this.webcam = document.getElementById('webcam');
+                    this.webcam.srcObject = stream;
+                    
+                    this.isWebcamActive = true;
+                    document.getElementById('toggle-webcam').textContent = 'Stop Webcam';
+                    document.getElementById('toggle-tracking').disabled = false;
+                    document.getElementById('status').textContent = 'Webcam active. Click "Start Tracking" to begin head tracking.';
+                    
+                } catch (error) {
+                    console.error('Error accessing webcam:', error);
+                    document.getElementById('status').textContent = 'Error: Could not access webcam';
+                }
+            }
+            
+            stopWebcam() {
+                if (this.webcam && this.webcam.srcObject) {
+                    this.webcam.srcObject.getTracks().forEach(track => track.stop());
+                    this.webcam.srcObject = null;
+                }
+                
+                this.stopTracking();
+                this.isWebcamActive = false;
+                document.getElementById('toggle-webcam').textContent = 'Start Webcam';
+                document.getElementById('toggle-tracking').disabled = true;
+                document.getElementById('status').textContent = 'Webcam stopped.';
+            }
+            
+            async startTracking() {
+                if (!this.isWebcamActive) return;
+                
+                try {
+                    this.faceDetection = new FaceDetection({
+                        locateFile: (file) => {
+                            return `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`;
+                        }
+                    });
+                    
+                    this.faceDetection.setOptions({
+                        model: 'short',
+                        minDetectionConfidence: 0.5
+                    });
+                    
+                    this.faceDetection.onResults((results) => {
+                        this.onFaceDetectionResults(results);
+                    });
+                    
+                    const camera = new Camera(this.webcam, {
+                        onFrame: async () => {
+                            await this.faceDetection.send({ image: this.webcam });
+                        },
+                        width: 640,
+                        height: 480
+                    });
+                    
+                    camera.start();
+                    
+                    this.isTrackingActive = true;
+                    document.getElementById('toggle-tracking').textContent = 'Stop Tracking';
+                    document.getElementById('status').textContent = 'Head tracking active!';
+                    
+                } catch (error) {
+                    console.error('Error starting face tracking:', error);
+                    document.getElementById('status').textContent = 'Error: Could not start face tracking';
+                }
+            }
+            
+            stopTracking() {
+                if (this.faceDetection) {
+                    this.faceDetection.close();
+                    this.faceDetection = null;
+                }
+                
+                this.isTrackingActive = false;
+                document.getElementById('toggle-tracking').textContent = 'Start Tracking';
+                document.getElementById('status').textContent = 'Head tracking stopped.';
+                
+                // Reset camera to normal perspective
+                this.updateCameraProjection();
+            }
+            
+            onFaceDetectionResults(results) {
+                if (results.detections && results.detections.length > 0) {
+                    const detection = results.detections[0];
+                    
+                    // Try different possible result structures
+                    let bbox = null;
+                    
+                    if (detection.locationData && detection.locationData.relativeBoundingBox) {
+                        bbox = detection.locationData.relativeBoundingBox;
+                    } else if (detection.boundingBox) {
+                        bbox = detection.boundingBox;
+                    } else if (detection.bbox) {
+                        bbox = detection.bbox;
+                    }
+                    
+                    if (bbox) {
+                        // Handle different bbox formats
+                        let centerX, centerY, faceWidth;
+                        if (bbox.xCenter !== undefined && bbox.yCenter !== undefined && bbox.width !== undefined) {
+                            centerX = bbox.xCenter;
+                            centerY = bbox.yCenter;
+                            faceWidth = bbox.width;
+                        } else if (bbox.x !== undefined && bbox.y !== undefined && bbox.width !== undefined && bbox.height !== undefined) {
+                            centerX = bbox.x + bbox.width / 2;
+                            centerY = bbox.y + bbox.height / 2;
+                            faceWidth = bbox.width;
+                        } else {
+                            console.warn('Unknown bbox format:', bbox);
+                            return;
+                        }
+                        
+                        // Convert to screen coordinates (-1 to 1)
+                        this.headPosition.x = (centerX - 0.5) * 2;
+                        this.headPosition.y = (0.5 - centerY) * 2; // Flip Y axis
+                        
+                        // Estimate Z (distance) based on face width in image
+                        // Assume faceWidth is relative (0..1), so estimate distance
+                        if (faceWidth) {
+                            // Estimate distance: (averageFaceWidth * focalLength) / faceWidthInPixels
+                            // Here, we use a simple inverse relationship for demo
+                            // Clamp faceWidth to avoid division by zero
+                            const minFaceWidth = 0.05;
+                            const clampedFaceWidth = Math.max(faceWidth, minFaceWidth);
+                            const estimatedZ = (this.averageFaceWidth / clampedFaceWidth); // in cm, relative
+                            this.headPosition.z = estimatedZ;
+                        }
+                        
+                        // Smooth the movement
+                        this.smoothedHeadPosition.x += (this.headPosition.x - this.smoothedHeadPosition.x) * this.smoothingFactor;
+                        this.smoothedHeadPosition.y += (this.headPosition.y - this.smoothedHeadPosition.y) * this.smoothingFactor;
+                        this.smoothedHeadPosition.z += (this.headPosition.z - this.smoothedHeadPosition.z) * this.smoothingFactor;
+                        
+                        // Update camera position based on head position
+                        this.updateCameraProjection();
+                    } else {
+                        console.warn('No valid bounding box found in detection:', detection);
+                    }
+                } else {
+                    // No face detected - maintain last known position or reset smoothly
+                    // This prevents jarring jumps when face detection temporarily fails
+                    // console.log('No face detected, maintaining last position');
+                }
+            }
+            
+            updateCameraProjection() {
+                if (!this.camera) return;
+                
+                if (!this.isTrackingActive) {
+                    // Reset to normal perspective when not tracking
+                    this.camera.fov = 75;
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    return;
+                }
+                
+                // Fish tank VR: Create asymmetric frustum based on head position
+                // The screen acts as a window into 3D space
+                
+                const eyeX = this.smoothedHeadPosition.x; // Head position in world units
+                const eyeY = this.smoothedHeadPosition.y;
+                const eyeZ = this.smoothedHeadPosition.z / 10; // Convert cm to world units
+                
+                // Screen bounds in world coordinates (screen is centered at origin)
+                const screenLeft = -this.worldScreenWidth / 2;
+                const screenRight = this.worldScreenWidth / 2;
+                const screenBottom = -this.worldScreenHeight / 2;
+                const screenTop = this.worldScreenHeight / 2;
+                const screenZ = 0; // Screen is at Z=0 plane
+                
+                // Calculate viewing distance to screen plane
+                const viewDistance = Math.max(0.1, eyeZ - screenZ); // Prevent division by zero
+                
+                // Near and far clipping planes
+                const near = 0.1;
+                const far = 1000;
+                
+                // Calculate asymmetric frustum bounds
+                // These create the "window" effect where head movement changes perspective
+                const left = (screenLeft - eyeX) * near / viewDistance;
+                const right = (screenRight - eyeX) * near / viewDistance;
+                const bottom = (screenBottom - eyeY) * near / viewDistance;
+                const top = (screenTop - eyeY) * near / viewDistance;
+                
+                // Apply asymmetric frustum using Three.js makePerspective
+                this.camera.projectionMatrix.makePerspective(left, right, top, bottom, near, far);
+                this.camera.projectionMatrixInverse.copy(this.camera.projectionMatrix).invert();
+                
+                // Position camera at the eye position but keep it looking at screen center
+                this.camera.position.set(eyeX, eyeY, eyeZ);
+                this.camera.lookAt(0, 0, 0); // Always look at screen center
+                this.camera.updateMatrixWorld();
+            }
+            
+            // Simplified mouse-based model rotation (objects stay in world space)
+            updateModelRotation() {
+                if (this.model) {
+                    this.model.rotation.x = this.mouseControls.rotationX;
+                    this.model.rotation.y = this.mouseControls.rotationY;
+                    // No head-tracking rotation - objects stay fixed in world space!
+                }
+            }
+            
+            loadModel(file) {
+                const fileName = file.name.toLowerCase();
+                const fileExtension = fileName.split('.').pop();
+                
+                // Clear previous model
+                if (this.model) {
+                    this.modelGroup.remove(this.model);
+                    this.model = null;
+                }
+                
+                // Update status
+                document.getElementById('status').textContent = `Loading ${file.name}...`;
+                
+                // Create file URL
+                const fileURL = URL.createObjectURL(file);
+                
+                if (fileExtension === 'glb' || fileExtension === 'gltf') {
+                    this.loadGLTF(fileURL, file.name);
+                } else if (fileExtension === 'obj') {
+                    this.loadOBJ(fileURL, file.name);
+                } else {
+                    document.getElementById('status').textContent = `Unsupported file format: ${fileExtension}`;
+                }
+            }
+            
+            loadGLTF(url, fileName) {
+                this.gltfLoader.load(
+                    url,
+                    (gltf) => {
+                        console.log('GLTF loaded successfully:', gltf);
+                        
+                        this.model = gltf.scene;
+                        
+                        // Enable shadows for all meshes
+                        this.model.traverse((child) => {
+                            if (child.isMesh) {
+                                child.castShadow = true;
+                                child.receiveShadow = true;
+                            }
+                        });
+                        
+                        // Auto-scale and center the model
+                        this.scaleAndCenterModel(this.model);
+                        
+                        // Add to scene
+                        this.modelGroup.add(this.model);
+                        
+                        // Clean up URL
+                        URL.revokeObjectURL(url);
+                        
+                        document.getElementById('status').textContent = `GLTF loaded: ${fileName}`;
+                    },
+                    (progress) => {
+                        const percent = Math.round((progress.loaded / progress.total) * 100);
+                        document.getElementById('status').textContent = `Loading ${fileName}: ${percent}%`;
+                    },
+                    (error) => {
+                        console.error('Error loading GLTF:', error);
+                        document.getElementById('status').textContent = `Error loading ${fileName}`;
+                        URL.revokeObjectURL(url);
+                    }
+                );
+            }
+            
+            loadOBJ(url, fileName) {
+                this.objLoader.load(
+                    url,
+                    (object) => {
+                        console.log('OBJ loaded successfully:', object);
+                        
+                        this.model = object;
+                        
+                        // Apply default material to OBJ (since OBJ files often don't have materials)
+                        const defaultMaterial = new THREE.MeshLambertMaterial({ 
+                            color: 0x888888,
+                            side: THREE.DoubleSide 
+                        });
+                        
+                        this.model.traverse((child) => {
+                            if (child.isMesh) {
+                                if (!child.material || child.material.length === 0) {
+                                    child.material = defaultMaterial;
+                                }
+                                child.castShadow = true;
+                                child.receiveShadow = true;
+                            }
+                        });
+                        
+                        // Auto-scale and center the model
+                        this.scaleAndCenterModel(this.model);
+                        
+                        // Add to scene
+                        this.modelGroup.add(this.model);
+                        
+                        // Clean up URL
+                        URL.revokeObjectURL(url);
+                        
+                        document.getElementById('status').textContent = `OBJ loaded: ${fileName}`;
+                    },
+                    (progress) => {
+                        if (progress.lengthComputable) {
+                            const percent = Math.round((progress.loaded / progress.total) * 100);
+                            document.getElementById('status').textContent = `Loading ${fileName}: ${percent}%`;
+                        }
+                    },
+                    (error) => {
+                        console.error('Error loading OBJ:', error);
+                        document.getElementById('status').textContent = `Error loading ${fileName}`;
+                        URL.revokeObjectURL(url);
+                    }
+                );
+            }
+            
+            scaleAndCenterModel(model) {
+                // Calculate bounding box
+                const box = new THREE.Box3().setFromObject(model);
+                const size = box.getSize(new THREE.Vector3());
+                const center = box.getCenter(new THREE.Vector3());
+                
+                // Scale model to fit in a reasonable size (max 3 units)
+                const maxSize = Math.max(size.x, size.y, size.z);
+                const targetSize = 3;
+                const scale = targetSize / maxSize;
+                
+                model.scale.setScalar(scale);
+                
+                // Center the model at origin (screen center in fish tank VR)
+                model.position.x = -center.x * scale;
+                model.position.y = -center.y * scale;
+                model.position.z = -center.z * scale;
+                
+                console.log(`Model scaled by ${scale.toFixed(2)}x and centered at origin`);
+            }
+            
+            animate() {
+                requestAnimationFrame(() => this.animate());
+                
+                // Calculate FPS
+                const now = performance.now();
+                if (this.lastTime !== 0) {
+                    this.fps = Math.round(1000 / (now - this.lastTime));
+                }
+                this.lastTime = now;
+                
+                // Head-based model rotation (side-to-side)
+                if (this.model) {
+                    // Map head X position (-1 to 1) to -45deg to +45deg (additive to mouse rotation)
+                    const headRotationY = this.smoothedHeadPosition.x * (Math.PI / 4); // 45deg max
+                    this.model.rotation.y = this.mouseControls.rotationY + headRotationY;
+                    this.model.rotation.x = this.mouseControls.rotationX;
+                }
+                
+                // Update debug info
+                this.updateDebugInfo();
+                
+                // Render the scene
+                this.renderer.render(this.scene, this.camera);
+            }
+            
+            updateDebugInfo() {
+                const debugInfo = document.getElementById('debug-info');
+                
+                debugInfo.innerHTML = 
+                    'Head Position: (' + this.smoothedHeadPosition.x.toFixed(1) + ', ' + this.smoothedHeadPosition.y.toFixed(1) + ', ' + this.smoothedHeadPosition.z.toFixed(0) + 'cm)<br>' +
+                    'Camera: (' + this.camera.position.x.toFixed(1) + ', ' + this.camera.position.y.toFixed(1) + ', ' + this.camera.position.z.toFixed(1) + ')<br>' +
+                    'Screen Size: ' + this.screenWidth + '×' + this.screenHeight + 'cm<br>' +
+                    'World Screen: ' + this.worldScreenWidth.toFixed(1) + '×' + this.worldScreenHeight.toFixed(1) + '<br>' +
+                    'Mouse Rotation: (' + this.mouseControls.rotationX.toFixed(2) + ', ' + this.mouseControls.rotationY.toFixed(2) + ')<br>' +
+                    'FPS: ' + this.fps;
+            }
+        }
+        
+        // Initialize the application
+        const app = new HeadTracked3DViewer();
+    </script>
+</body>
+</html>
